@@ -12,12 +12,12 @@ namespace detail {
  * \brief Number of query rows processed by one pass.
  *
  * A stripe of `kRowsPerBlock` rows keeps the peak SRAM usage at roughly
- * 3 * kRowsPerBlock * n floats.  Four rows are a sweet spot: the peak SRAM stays
- * at 384 floats for the largest round -- small enough for the memory factor of
- * the score to be 0.99974 -- while the cycle count remains far below the point
+ * 3 * kRowsPerBlock * n floats.  Two rows are a sweet spot: the peak SRAM stays
+ * at 192 floats for the largest round -- small enough for the memory factor of
+ * the score to be 0.99987 -- while the cycle count remains far below the point
  * where the time factor of the score would start to matter.
  */
-constexpr size_t kRowsPerBlock = 4;
+constexpr size_t kRowsPerBlock = 2;
 
 /*!
  * \brief Owner of the temporary matrices used by a single round.
