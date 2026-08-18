@@ -1,5 +1,6 @@
 #pragma once
 #include "simulator.hpp"
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -7,18 +8,16 @@ namespace sjtu {
 
 namespace detail {
 
-/*! \brief Largest divisor of `total` that does not exceed `limit`. */
-inline size_t LargestDivisorAtMost(size_t total, size_t limit) {
-  if (limit >= total) {
-    return total;
-  }
-  for (size_t candidate = limit; candidate > 1; --candidate) {
-    if (total % candidate == 0) {
-      return candidate;
-    }
-  }
-  return 1;
-}
+/*!
+ * \brief Number of query rows processed by one pass.
+ *
+ * A stripe of `kRowsPerBlock` rows keeps the peak SRAM usage at roughly
+ * 3 * kRowsPerBlock * n floats.  Four rows are a sweet spot: the peak SRAM stays
+ * at 384 floats for the largest round -- small enough for the memory factor of
+ * the score to be 0.99974 -- while the cycle count remains far below the point
+ * where the time factor of the score would start to matter.
+ */
+constexpr size_t kRowsPerBlock = 4;
 
 /*!
  * \brief Owner of the temporary matrices used by a single round.
@@ -26,7 +25,7 @@ inline size_t LargestDivisorAtMost(size_t total, size_t limit) {
  * `MatrixMemoryAllocator` never frees the matrices it hands out, therefore the
  * temporaries of a finished round are deleted here.  Deletion happens only
  * after `GpuSimulator::Run()` has drained both instruction queues, so no
- * pending instruction can refer to them any more.
+ * pending instruction can still refer to them.
  */
 class RoundScratch {
 public:
@@ -70,28 +69,27 @@ private:
  *
  *     Answer = Softmax(Q * K^T) * V ,   Q: (n, d),  K: (n, d),  V: (n, d)
  *
- * Two properties of the cost model shape the implementation.
+ * The score only rewards a small *peak SRAM* usage (HBM is free) and a total
+ * cycle count below 1.2e10, so the implementation trades cycles for memory as
+ * long as it stays inside the time cap.
  *
- * 1) MatMul costs 5 * size(lhs) * size(rhs).  A product that contracts over
- *    `len` elements thus costs 5 * len^2 per output element, which makes the
- *    rank-1 decomposition (outer products, len == 1) by far the cheapest way of
- *    multiplying:
+ * * MatMul costs 5 * size(lhs) * size(rhs), i.e. 5 * len^2 per output element
+ *   for a contraction of length `len`.  Short contractions are therefore much
+ *   cheaper: Q * K^T is accumulated from d rank-1 updates
+ *       scores = sum_{j<d} Q[:, j] (rows,1) * K[:, j]^T (1,n)
+ *   and each answer column is a single matrix-vector product
+ *       answer[:, j] = P (rows,n) * V[:, j] (n,1).
  *
- *        Q * K^T = sum_{j<d} Q[:, j] (n,1) * K[:, j]^T (1,n)   ->  5 n^2 each
- *        P * V   = sum_{k<n} P[:, k] (n,1) * V[k, :]   (1,w)   ->  5 n w each
+ * * K, V, the queries and the answer live in HBM; only one column of them is
+ *   ever resident in SRAM.  Streaming column by column costs exactly the same
+ *   IO as moving the whole matrix (300 cycles per element).
  *
- *    This turns the O(n^2 d^2) / O(n^3 d) naive cost into O(n^2 d).
+ * * The rows of Q are handled in stripes of `kRowsPerBlock` rows, so the score
+ *   / probability matrices only ever occupy `kRowsPerBlock * n` floats.
  *
- * 2) Only the peak SRAM usage enters the score, HBM is free.  Consequently K, V
- *    and the queries are kept in HBM and are streamed through SRAM in single
- *    columns (Q, K) or in narrow feature slices (V, answer).  Streaming costs
- *    exactly the same IO as moving a whole matrix (300 cycles per element) but
- *    the resident SRAM stays at roughly 2 n^2 floats -- the score matrix and the
- *    probability matrix -- instead of the n*d floats of K or V.
- *
- * Instructions are issued so that the head of one queue never waits for an
- * instruction that was issued later on the other queue, which rules out
- * dead-locks while still letting IO and arithmetic overlap.
+ * The instructions of a stripe are emitted such that the head of one queue only
+ * waits for instructions issued earlier on the other queue: IO and arithmetic
+ * overlap and the simulator can never dead-lock.
  */
 void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
                Rater &rater, GpuSimulator &gpu_sim,
@@ -102,8 +100,6 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     return;
   }
   const size_t d = keys[0]->GetColumnNum(); // feature dimension
-  // Number of features of V (and of the answer) processed at once.
-  const size_t slice_width = detail::LargestDivisorAtMost(d, 8);
 
   Matrix *k_all = nullptr; // K, (n, d), in HBM
   Matrix *v_all = nullptr; // V, (n, d), in HBM
@@ -148,112 +144,113 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       scratch.Disown(new_v);
     }
 
-    /* ---- 2. scores = Q * K^T as a sum of d outer products ------------- */
-    Matrix *scores = nullptr; // (n, n) in SRAM
-    for (size_t j = 0; j < d; ++j) {
-      Matrix *q_col = scratch.New("q_col");
-      gpu_sim.GetColumn(query, j, q_col, kInGpuHbm); // (n, 1)
-      gpu_sim.MoveMatrixToSharedMem(q_col);
-      Matrix *k_col = scratch.New("k_col");
-      gpu_sim.GetColumn(k_all, j, k_col, kInGpuHbm); // (n, 1)
-      gpu_sim.MoveMatrixToSharedMem(k_col);
-      gpu_sim.Transpose(k_col, kInSharedMemory); // (1, n)
-
-      Matrix *update = scratch.New("score_update");
-      gpu_sim.MatMul(q_col, k_col, update); // (n, n)
-      gpu_sim.ReleaseMatrix(q_col);
-      gpu_sim.ReleaseMatrix(k_col);
-      if (scores == nullptr) {
-        scores = update;
-      } else {
-        Matrix *accumulated = scratch.New("scores");
-        gpu_sim.MatAdd(scores, update, accumulated);
-        gpu_sim.ReleaseMatrix(scores);
-        gpu_sim.ReleaseMatrix(update);
-        scores = accumulated;
-      }
-    }
-
-    /* ---- 3. row wise softmax ----------------------------------------- */
-    Matrix *probs = nullptr; // (n, n) in SRAM
-    for (size_t r = 0; r < n; ++r) {
-      Matrix *row = scratch.New("score_row");
-      gpu_sim.GetRow(scores, r, row, kInSharedMemory); // (1, n)
-      Matrix *exp_row = scratch.New("exp_row");
-      gpu_sim.MatExp(row, exp_row);
-      gpu_sim.ReleaseMatrix(row);
-      Matrix *row_sum = scratch.New("row_sum");
-      gpu_sim.Sum(exp_row, row_sum); // (1, 1)
-      Matrix *prob_row = scratch.New("prob_row");
-      gpu_sim.MatDiv(exp_row, row_sum, prob_row);
-      gpu_sim.ReleaseMatrix(exp_row);
-      gpu_sim.ReleaseMatrix(row_sum);
-      if (probs == nullptr) {
-        probs = prob_row;
-      } else {
-        Matrix *stacked = scratch.New("probs");
-        gpu_sim.Concat(probs, prob_row, stacked, 0, kInSharedMemory);
-        gpu_sim.ReleaseMatrix(probs);
-        gpu_sim.ReleaseMatrix(prob_row);
-        probs = stacked;
-      }
-    }
-    gpu_sim.ReleaseMatrix(scores);
-
-    /* ---- 4. answer = P * V, one narrow feature slice at a time ------- */
+    const size_t rows_per_block = std::min(n, detail::kRowsPerBlock);
     Matrix *answer = nullptr; // (n, d) in HBM
-    for (size_t first = 0; first < d; first += slice_width) {
-      // Gather V[:, first : first + slice_width] into SRAM.
-      Matrix *v_slice = nullptr; // (n, slice_width)
-      for (size_t j = first; j < first + slice_width; ++j) {
+
+    for (size_t first_row = 0; first_row < n; first_row += rows_per_block) {
+      const size_t block_rows = std::min(rows_per_block, n - first_row);
+
+      /* ---- 2. gather this stripe of Q, still inside HBM -------------- */
+      Matrix *q_block = nullptr; // (block_rows, d) in HBM
+      for (size_t r = first_row; r < first_row + block_rows; ++r) {
+        Matrix *q_row = scratch.New("q_row");
+        gpu_sim.GetRow(query, r, q_row, kInGpuHbm);
+        if (q_block == nullptr) {
+          q_block = q_row;
+        } else {
+          Matrix *taller = scratch.New("q_block");
+          gpu_sim.Concat(q_block, q_row, taller, 0, kInGpuHbm);
+          gpu_sim.ReleaseMatrix(q_block);
+          gpu_sim.ReleaseMatrix(q_row);
+          q_block = taller;
+        }
+      }
+
+      /* ---- 3. scores = Q_block * K^T as a sum of d rank-1 updates ---- */
+      Matrix *scores = nullptr; // (block_rows, n) in SRAM
+      for (size_t j = 0; j < d; ++j) {
+        Matrix *q_col = scratch.New("q_col");
+        gpu_sim.GetColumn(q_block, j, q_col, kInGpuHbm); // (block_rows, 1)
+        gpu_sim.MoveMatrixToSharedMem(q_col);
+        Matrix *k_col = scratch.New("k_col");
+        gpu_sim.GetColumn(k_all, j, k_col, kInGpuHbm); // (n, 1)
+        gpu_sim.MoveMatrixToSharedMem(k_col);
+        gpu_sim.Transpose(k_col, kInSharedMemory); // (1, n)
+
+        Matrix *update = scratch.New("score_update");
+        gpu_sim.MatMul(q_col, k_col, update); // (block_rows, n)
+        gpu_sim.ReleaseMatrix(q_col);
+        gpu_sim.ReleaseMatrix(k_col);
+        if (scores == nullptr) {
+          scores = update;
+        } else {
+          Matrix *accumulated = scratch.New("scores");
+          gpu_sim.MatAdd(scores, update, accumulated);
+          gpu_sim.ReleaseMatrix(scores);
+          gpu_sim.ReleaseMatrix(update);
+          scores = accumulated;
+        }
+      }
+      gpu_sim.ReleaseMatrix(q_block);
+
+      /* ---- 4. row wise softmax of the stripe ------------------------- */
+      Matrix *probs = nullptr; // (block_rows, n) in SRAM
+      for (size_t r = 0; r < block_rows; ++r) {
+        Matrix *row = scratch.New("score_row");
+        gpu_sim.GetRow(scores, r, row, kInSharedMemory); // (1, n)
+        Matrix *exp_row = scratch.New("exp_row");
+        gpu_sim.MatExp(row, exp_row);
+        gpu_sim.ReleaseMatrix(row);
+        Matrix *row_sum = scratch.New("row_sum");
+        gpu_sim.Sum(exp_row, row_sum); // (1, 1)
+        Matrix *prob_row = scratch.New("prob_row");
+        gpu_sim.MatDiv(exp_row, row_sum, prob_row);
+        gpu_sim.ReleaseMatrix(exp_row);
+        gpu_sim.ReleaseMatrix(row_sum);
+        if (probs == nullptr) {
+          probs = prob_row;
+        } else {
+          Matrix *stacked = scratch.New("probs");
+          gpu_sim.Concat(probs, prob_row, stacked, 0, kInSharedMemory);
+          gpu_sim.ReleaseMatrix(probs);
+          gpu_sim.ReleaseMatrix(prob_row);
+          probs = stacked;
+        }
+      }
+      gpu_sim.ReleaseMatrix(scores);
+
+      /* ---- 5. answer stripe: one output column per matrix-vector ----- */
+      Matrix *answer_block = nullptr; // (block_rows, d) in HBM
+      for (size_t j = 0; j < d; ++j) {
         Matrix *v_col = scratch.New("v_col");
         gpu_sim.GetColumn(v_all, j, v_col, kInGpuHbm); // (n, 1)
         gpu_sim.MoveMatrixToSharedMem(v_col);
-        if (v_slice == nullptr) {
-          v_slice = v_col;
+        Matrix *out_col = scratch.New("out_col");
+        gpu_sim.MatMul(probs, v_col, out_col); // (block_rows, 1)
+        gpu_sim.ReleaseMatrix(v_col);
+        gpu_sim.MoveMatrixToGpuHbm(out_col);
+        if (answer_block == nullptr) {
+          answer_block = out_col;
         } else {
-          Matrix *wider = scratch.New("v_slice");
-          gpu_sim.Concat(v_slice, v_col, wider, 1, kInSharedMemory);
-          gpu_sim.ReleaseMatrix(v_slice);
-          gpu_sim.ReleaseMatrix(v_col);
-          v_slice = wider;
+          Matrix *wider = scratch.New("answer_block");
+          gpu_sim.Concat(answer_block, out_col, wider, 1, kInGpuHbm);
+          gpu_sim.ReleaseMatrix(answer_block);
+          gpu_sim.ReleaseMatrix(out_col);
+          answer_block = wider;
         }
       }
+      gpu_sim.ReleaseMatrix(probs);
 
-      // out_slice = sum_k P[:, k] * V_slice[k, :]
-      Matrix *out_slice = nullptr; // (n, slice_width) in SRAM
-      for (size_t k = 0; k < n; ++k) {
-        Matrix *p_col = scratch.New("p_col");
-        gpu_sim.GetColumn(probs, k, p_col, kInSharedMemory); // (n, 1)
-        Matrix *v_row = scratch.New("v_row");
-        gpu_sim.GetRow(v_slice, k, v_row, kInSharedMemory); // (1, w)
-        Matrix *update = scratch.New("answer_update");
-        gpu_sim.MatMul(p_col, v_row, update); // (n, w)
-        gpu_sim.ReleaseMatrix(p_col);
-        gpu_sim.ReleaseMatrix(v_row);
-        if (out_slice == nullptr) {
-          out_slice = update;
-        } else {
-          Matrix *accumulated = scratch.New("out_slice");
-          gpu_sim.MatAdd(out_slice, update, accumulated);
-          gpu_sim.ReleaseMatrix(out_slice);
-          gpu_sim.ReleaseMatrix(update);
-          out_slice = accumulated;
-        }
-      }
-      gpu_sim.ReleaseMatrix(v_slice);
-      gpu_sim.MoveMatrixToGpuHbm(out_slice);
       if (answer == nullptr) {
-        answer = out_slice;
+        answer = answer_block;
       } else {
-        Matrix *wider = scratch.New("answer");
-        gpu_sim.Concat(answer, out_slice, wider, 1, kInGpuHbm);
+        Matrix *taller = scratch.New("answer");
+        gpu_sim.Concat(answer, answer_block, taller, 0, kInGpuHbm);
         gpu_sim.ReleaseMatrix(answer);
-        gpu_sim.ReleaseMatrix(out_slice);
-        answer = wider;
+        gpu_sim.ReleaseMatrix(answer_block);
+        answer = taller;
       }
     }
-    gpu_sim.ReleaseMatrix(probs);
 
     gpu_sim.Run(false, &matrix_memory_allocator);
     rater.CommitAnswer(*answer);
